@@ -7,17 +7,52 @@ use std::fmt::Write as _;
 use crate::ir::*;
 use crate::naming;
 
-pub const DEPENDENCIES_TOML: &str = r#"reqwest = { version = "0.13", features = ["json", "multipart", "stream", "query", "form"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-"#;
+/// Crates the generated client needs: (crate, version requirement, features).
+pub const DEPENDENCIES: &[(&str, &str, &[&str])] = &[
+    ("reqwest", "0.13", &["json", "multipart", "stream", "query", "form"]),
+    ("serde", "1", &["derive"]),
+    ("serde_json", "1", &[]),
+    ("tokio", "1", &["rt-multi-thread", "macros"]),
+];
+
+/// A POSIX shell script of `cargo add` commands that installs [`DEPENDENCIES`] into the crate
+/// in the current directory. Its lines can equally be pasted into a terminal one by one.
+pub fn dependencies_script() -> String {
+    let mut s = String::from(
+        "#!/bin/sh\n\
+         # Adds the dependencies of the generated API client to the crate in the current\n\
+         # directory. Run it from the consuming crate's root with `sh DEPENDENCIES.sh`, or paste\n\
+         # the commands into a terminal.\n\
+         #\n\
+         # reqwest's default features may be turned off afterwards (e.g. to switch from rustls to\n\
+         # `native-tls`) as long as the features listed here stay enabled. The client is async and\n\
+         # expects a tokio runtime; adjust the tokio features to what your binary needs.\n\
+         set -eu\n",
+    );
+    for (name, version, features) in DEPENDENCIES {
+        s.push_str(&format!("cargo add {name}@{version}"));
+        if !features.is_empty() {
+            s.push_str(&format!(" --features {}", features.join(",")));
+        }
+        s.push('\n');
+    }
+    s
+}
+
+/// Code generation switches that do not change the IR.
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// Derive `Default` for every struct whose fields all implement `Default` (strings,
+    /// numbers, booleans, `Vec`, maps, `Option`, and other such structs), not only for structs
+    /// made of `Option` fields. Enums and `FilePart` fields never qualify.
+    pub derive_default_when_possible: bool,
+}
 
 /// (file name, contents) pairs to write into the output module directory.
-pub fn generate(model: &Model) -> Result<Vec<(String, String)>> {
+pub fn generate(model: &Model, opts: &Options) -> Result<Vec<(String, String)>> {
     let mut files = vec![
         ("mod.rs".to_string(), gen_mod(model)?),
-        ("types.rs".to_string(), gen_types(model)?),
+        ("types.rs".to_string(), gen_types(model, opts)?),
     ];
     if !model.tags.is_empty() {
         files.push(("tags/mod.rs".to_string(), gen_tags_mod(model)));
@@ -83,7 +118,45 @@ fn doc_comment(out: &mut String, indent: &str, text: &str) {
 // types.rs
 // ---------------------------------------------------------------------------------------------
 
-fn gen_types(model: &Model) -> Result<String> {
+/// Whether each type gets `#[derive(Default)]`, indexed by `TypeId`.
+fn default_derives(model: &Model, opts: &Options) -> Vec<bool> {
+    fn ty_ok(model: &Model, t: &TypeRef, opts: &Options, memo: &mut Vec<Option<bool>>, stack: &mut Vec<TypeId>) -> bool {
+        match model.resolve(t) {
+            TypeRef::String | TypeRef::Int | TypeRef::Float | TypeRef::Bool | TypeRef::Any => true,
+            TypeRef::Option(_) | TypeRef::Vec(_) | TypeRef::Map(_) => true,
+            TypeRef::Upload => false,
+            TypeRef::Named(id) => named_ok(model, id, opts, memo, stack),
+        }
+    }
+    fn named_ok(model: &Model, id: TypeId, opts: &Options, memo: &mut Vec<Option<bool>>, stack: &mut Vec<TypeId>) -> bool {
+        if let Some(v) = memo[id] {
+            return v;
+        }
+        if stack.contains(&id) {
+            // A struct that contains itself by value cannot have a finite default.
+            return false;
+        }
+        let v = match &model.types[id].def {
+            TypeDef::Struct { fields, .. } if opts.derive_default_when_possible => {
+                stack.push(id);
+                let ok = fields.iter().all(|f| ty_ok(model, &f.ty, opts, memo, stack));
+                stack.pop();
+                ok
+            }
+            TypeDef::Struct { fields, .. } => fields.iter().all(|f| f.ty.is_option()),
+            TypeDef::StringEnum { .. } | TypeDef::Untagged { .. } => false,
+        };
+        memo[id] = Some(v);
+        v
+    }
+    let mut memo = vec![None; model.types.len()];
+    (0..model.types.len())
+        .map(|id| named_ok(model, id, opts, &mut memo, &mut Vec::new()))
+        .collect()
+}
+
+fn gen_types(model: &Model, opts: &Options) -> Result<String> {
+    let defaults = default_derives(model, opts);
     let e = Emit {
         types: "",
         root: "super::",
@@ -110,9 +183,9 @@ fn gen_types(model: &Model) -> Result<String> {
                 multipart,
             } => {
                 if *multipart {
-                    gen_multipart_struct(model, &mut out, nt, fields, &e)?;
+                    gen_multipart_struct(model, &mut out, nt, fields, defaults[id], &e)?;
                 } else {
-                    gen_struct(model, &mut out, id, nt, fields, extra.as_ref(), &e)?;
+                    gen_struct(model, &mut out, id, nt, fields, extra.as_ref(), defaults[id], &e)?;
                 }
             }
             TypeDef::StringEnum { values } => gen_string_enum(&mut out, nt, values),
@@ -131,6 +204,7 @@ fn field_names(fields: &[Field]) -> Vec<String> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gen_struct(
     model: &Model,
     out: &mut String,
@@ -138,12 +212,12 @@ fn gen_struct(
     nt: &NamedType,
     fields: &[Field],
     extra: Option<&TypeRef>,
+    derive_default: bool,
     e: &Emit,
 ) -> Result<()> {
     let names = field_names(fields);
-    let all_optional = fields.iter().all(|f| f.ty.is_option());
     let mut derives = vec!["Serialize", "Deserialize", "Clone", "Debug", "PartialEq"];
-    if all_optional {
+    if derive_default {
         derives.push("Default");
     }
     let _ = writeln!(out, "#[derive({})]", derives.join(", "));
@@ -210,12 +284,13 @@ fn gen_multipart_struct(
     out: &mut String,
     nt: &NamedType,
     fields: &[Field],
+    derive_default: bool,
     e: &Emit,
 ) -> Result<()> {
     let names = field_names(fields);
     out.push_str("/// `multipart/form-data` request body. Binary fields take a [`FilePart`](super::FilePart),\n");
     out.push_str("/// which can wrap in-memory bytes, a stream, or a file on disk.\n");
-    if fields.iter().all(|f| f.ty.is_option()) {
+    if derive_default {
         out.push_str("#[derive(Debug, Default)]\n");
     } else {
         out.push_str("#[derive(Debug)]\n");
@@ -992,7 +1067,6 @@ impl Api {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
 
     use super::*;
 
@@ -1001,7 +1075,7 @@ mod tests {
             "openapi": "3.1.0", "info": {"title": "t", "version": "1"}, "servers": servers,
             "paths": {"/ping": {"get": {"operationId": "ping", "responses": {"200": {"description": "ok"}}}}}
         });
-        let model = crate::model::build(&doc).unwrap();
+        let model = crate::model::build(&doc, false).unwrap();
         gen_mod(&model).unwrap()
     }
 
@@ -1021,7 +1095,44 @@ mod tests {
     }
 
     #[test]
-    fn dependencies_snippet_is_a_valid_dependencies_table() {
-        toml::Table::from_str(DEPENDENCIES_TOML).unwrap();
+    fn default_derive_widens_with_option() {
+        let doc = serde_json::json!({
+            "openapi": "3.1.0", "info": {"title": "t", "version": "1"},
+            "paths": {"/a": {"post": {"operationId": "a", "requestBody": {"content": {"application/json": {"schema": {
+                "type": "object", "required": ["name", "tags", "kind", "nested"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "kind": {"type": "string", "enum": ["x", "y"]},
+                    "nested": {"type": "object", "required": ["n"], "properties": {"n": {"type": "integer"}}}
+                }}}}}, "responses": {"200": {"description": "ok"}}}}}
+        });
+        let model = crate::model::build(&doc, false).unwrap();
+        let derive_of = |src: &str, name: &str| {
+            let at = src.find(&format!("pub struct {name} ")).unwrap_or_else(|| panic!("{name}"));
+            src[..at].rsplit("#[derive(").next().unwrap().split(')').next().unwrap().to_string()
+        };
+        let plain = gen_types(&model, &Options::default()).unwrap();
+        assert!(!derive_of(&plain, "ABody").contains("Default"));
+        assert!(!derive_of(&plain, "Nested").contains("Default"));
+
+        let wide = gen_types(&model, &Options { derive_default_when_possible: true }).unwrap();
+        // `kind` is an enum, so the body still cannot be Default; the nested struct can.
+        assert!(!derive_of(&wide, "ABody").contains("Default"));
+        assert!(derive_of(&wide, "Nested").contains("Default"));
+    }
+
+    #[test]
+    fn dependencies_script_is_one_cargo_add_per_crate() {
+        let script = dependencies_script();
+        assert!(script.starts_with("#!/bin/sh\n"));
+        let commands: Vec<&str> =
+            script.lines().filter(|l| !l.starts_with('#') && !l.starts_with("set ")).collect();
+        assert_eq!(commands.len(), DEPENDENCIES.len());
+        for (cmd, (name, version, _)) in commands.iter().zip(DEPENDENCIES) {
+            assert!(cmd.starts_with(&format!("cargo add {name}@{version}")), "{cmd}");
+        }
+        assert!(script.contains("cargo add reqwest@0.13 --features json,multipart,stream,query,form\n"));
+        assert!(script.contains("cargo add serde_json@1\n"));
     }
 }

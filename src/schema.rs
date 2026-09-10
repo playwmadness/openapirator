@@ -1,4 +1,8 @@
-//! JSON Schema (OpenAPI 3.1 dialect) → IR conversion with structural de-duplication.
+//! JSON Schema (OpenAPI 3.1 dialect) → IR conversion.
+//!
+//! `$ref` targets are always shared. Structurally identical *inline* schemas are merged into one
+//! type only when the converter is built with `dedup = true`; otherwise every inline schema
+//! becomes its own type named after the place it appears in.
 
 use anyhow::{Result, bail};
 use serde_json::{Map, Value};
@@ -112,13 +116,62 @@ fn is_null_schema(v: &Value) -> bool {
 pub struct Converter<'a> {
     doc: &'a Value,
     pub types: Vec<NamedType>,
+    /// Merge structurally identical inline schemas into one type.
+    dedup: bool,
     keys: HashMap<String, TypeId>,
     ref_cache: HashMap<String, TypeRef>,
 }
 
 impl<'a> Converter<'a> {
-    pub fn new(doc: &'a Value) -> Self {
-        Converter { doc, types: Vec::new(), keys: HashMap::new(), ref_cache: HashMap::new() }
+    pub fn new(doc: &'a Value, dedup: bool) -> Self {
+        Converter { doc, types: Vec::new(), dedup, keys: HashMap::new(), ref_cache: HashMap::new() }
+    }
+
+    /// A key that is equal for structurally identical types, regardless of whether they were
+    /// merged into one `TypeId`. Named types are expanded recursively; cycles become `SELF`.
+    pub fn structural_key(&self, t: &TypeRef) -> String {
+        let mut stack = Vec::new();
+        self.deep_key(t, &mut stack)
+    }
+
+    fn deep_key(&self, t: &TypeRef, stack: &mut Vec<TypeId>) -> String {
+        match self.resolve(t) {
+            TypeRef::Named(id) => {
+                if stack.contains(&id) {
+                    return "SELF".into();
+                }
+                stack.push(id);
+                let key = match &self.types[id].def {
+                    TypeDef::Struct { fields, extra, multipart } => {
+                        let mut s = String::from(if *multipart { "M{" } else { "S{" });
+                        for f in fields {
+                            s.push_str(&format!(
+                                "{}{}:{};",
+                                f.json_name,
+                                if f.required { "!" } else { "?" },
+                                self.deep_key(&f.ty, stack)
+                            ));
+                        }
+                        if let Some(e) = extra {
+                            s.push_str(&format!("|{}", self.deep_key(e, stack)));
+                        }
+                        s.push('}');
+                        s
+                    }
+                    TypeDef::StringEnum { values } => format!("E{{{}}}", values.join("\u{1}")),
+                    TypeDef::Untagged { variants } => format!(
+                        "U{{{}}}",
+                        variants.iter().map(|v| self.deep_key(v, stack)).collect::<Vec<_>>().join("|")
+                    ),
+                };
+                stack.pop();
+                key
+            }
+            TypeRef::Option(x) => format!("o({})", self.deep_key(&x, stack)),
+            TypeRef::Vec(x) => format!("v({})", self.deep_key(&x, stack)),
+            TypeRef::Map(x) => format!("m({})", self.deep_key(&x, stack)),
+            other => self.ref_key(&other, None),
+        }
     }
 
     pub fn resolve(&self, t: &TypeRef) -> TypeRef {
@@ -425,7 +478,9 @@ impl<'a> Converter<'a> {
             return TypeRef::Any;
         }
         let key = self.def_key(&def, slot);
-        if let Some(&id) = self.keys.get(&key) {
+        if self.dedup
+            && let Some(&id) = self.keys.get(&key)
+        {
             return TypeRef::Named(id);
         }
         let nt = NamedType {
@@ -446,7 +501,9 @@ impl<'a> Converter<'a> {
                 self.types.len() - 1
             }
         };
-        self.keys.insert(key, id);
+        if self.dedup {
+            self.keys.insert(key, id);
+        }
         TypeRef::Named(id)
     }
 
@@ -494,16 +551,32 @@ mod tests {
     use serde_json::json;
 
     fn conv(doc: &Value, schema: &Value, root: &str) -> (Vec<NamedType>, TypeRef) {
-        let mut c = Converter::new(doc);
+        let mut c = Converter::new(doc, true);
         let t = c.convert(schema, &Ctx::root(root), &Scope { local_root: schema, multipart: false }).unwrap();
         (c.types, t)
+    }
+
+    #[test]
+    fn dedup_is_opt_in() {
+        let doc = json!({"type": "object", "properties": {
+            "a": {"type": "object", "properties": {"x": {"type": "string"}}},
+            "b": {"type": "object", "properties": {"x": {"type": "string"}}}
+        }});
+        let scope = Scope { local_root: &doc, multipart: false };
+        let count = |dedup: bool| {
+            let mut c = Converter::new(&doc, dedup);
+            c.convert(&doc, &Ctx::root("Root"), &scope).unwrap();
+            c.types.iter().filter(|t| t.is_live()).count()
+        };
+        assert_eq!(count(true), 2, "Root + one shared inner struct");
+        assert_eq!(count(false), 3, "Root + A + B");
     }
 
     #[test]
     fn dedups_identical_structures() {
         let doc = json!({});
         let s = json!({"type": "object", "properties": {"kind": {"type": "string", "enum": ["a", "b"]}, "n": {"type": ["integer", "null"]}}, "required": ["kind"]});
-        let mut c = Converter::new(&doc);
+        let mut c = Converter::new(&doc, true);
         let scope = Scope { local_root: &s, multipart: false };
         let a = c.convert(&s, &Ctx::root("FirstBody"), &scope).unwrap();
         let b = c.convert(&s, &Ctx::root("SecondBody"), &scope).unwrap();
@@ -546,7 +619,7 @@ mod tests {
         let def = json!({"anyOf": [{"type": "string"}, {"type": "array", "items": {"$ref": "#/$defs/n"}}, {"type": "object", "additionalProperties": {"$ref": "#/$defs/n"}}]});
         let s1 = json!({"type": "object", "properties": {"v": {"$ref": "#/$defs/n"}}, "$defs": {"n": def}});
         let s2 = json!({"type": "object", "properties": {"w": {"$ref": "#/$defs/n"}}, "$defs": {"n": def}});
-        let mut c = Converter::new(&doc);
+        let mut c = Converter::new(&doc, true);
         c.convert(&s1, &Ctx::root("A"), &Scope { local_root: &s1, multipart: false }).unwrap();
         c.convert(&s2, &Ctx::root("B"), &Scope { local_root: &s2, multipart: false }).unwrap();
         let live: Vec<&NamedType> = c.types.iter().filter(|t| t.is_live()).collect();
@@ -571,7 +644,7 @@ mod tests {
     #[test]
     fn components_ref_and_binary_upload() {
         let doc = json!({"components": {"schemas": {"Error": {"type": "object", "properties": {"error": {"type": "string"}}, "required": ["error"]}}}});
-        let mut c = Converter::new(&doc);
+        let mut c = Converter::new(&doc, true);
         let scope = Scope { local_root: &doc, multipart: false };
         let e1 = c.convert_ref("#/components/schemas/Error", &Ctx::root("Error"), &scope).unwrap();
         let inline = json!({"type": "object", "properties": {"error": {"type": "string"}}, "required": ["error"]});

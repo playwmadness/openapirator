@@ -57,8 +57,9 @@ pub const RESERVED_API_METHODS: &[&str] = &[
     "types",
 ];
 
-pub fn build(doc: &Value) -> Result<Model> {
-    let mut conv = Converter::new(doc);
+/// Build the IR. `dedup_types` merges structurally identical inline schemas into one type.
+pub fn build(doc: &Value, dedup_types: bool) -> Result<Model> {
+    let mut conv = Converter::new(doc, dedup_types);
     let doc_scope = Scope {
         local_root: doc,
         multipart: false,
@@ -330,9 +331,14 @@ pub fn build(doc: &Value) -> Result<Model> {
         });
     }
 
+    // Compare structurally so the typed error payload survives `dedup_types = false`, where an
+    // inline copy of the error schema is a distinct (but wire-compatible) type.
     let error_type = match error_schemas.first() {
         Some(first)
-            if error_schemas.iter().all(|t| t == first) && matches!(first, TypeRef::Named(_)) =>
+            if matches!(first, TypeRef::Named(_))
+                && error_schemas
+                    .iter()
+                    .all(|t| conv.structural_key(t) == conv.structural_key(first)) =>
         {
             first.clone()
         }
@@ -493,7 +499,7 @@ mod tests {
                 "/d": {"get": {"operationId": "get_c", "tags": ["datasets"], "responses": {"200": {"description": "ok"}}}}
             }
         });
-        let m = build(&doc).unwrap();
+        let m = build(&doc, false).unwrap();
         assert_eq!(m.tags.len(), 1);
         assert_eq!(m.tags[0].accessor, "datasets");
         assert_eq!(m.tags[0].struct_name, "DatasetsApi");
