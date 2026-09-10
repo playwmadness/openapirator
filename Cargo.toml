@@ -2,6 +2,15 @@
 name = "openapirator"
 version = "0.0.2"
 edition = "2024"
+description = "Generate Rust reqwest clients from OpenAPI 3.1 specs."
+license-file = "LICENSE"
+repository = "https://github.com/playwmadness/openapirator"
+keywords = ["cli", "openapi", "codegen", "api-client"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "openapirator"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
