@@ -89,6 +89,9 @@ struct GeneratorConfig {
     /// structs made of `Option` fields.
     #[serde(default)]
     derive_default_when_possible: bool,
+    /// Emit `anyOf` / `oneOf` object variants as struct variants instead of wrapping a struct.
+    #[serde(default = "default_true")]
+    inline_enum_variants: bool,
 }
 impl GeneratorConfig {
     fn dependencies_script_path(&self) -> Cow<'_, Path> {
@@ -107,6 +110,7 @@ impl Default for GeneratorConfig {
             dependencies_script_path: None,
             dedup_types: false,
             derive_default_when_possible: false,
+            inline_enum_variants: true,
         }
     }
 }
@@ -147,6 +151,11 @@ const KEY_DOCS: &[(&str, &str)] = &[
         "Derive `Default` for every struct whose fields all implement `Default` (strings,\n\
          numbers, Vec, maps, Option, nested such structs), not only for all-optional structs.\n\
          Enums and file-upload fields never qualify.",
+    ),
+    (
+        "inline_enum_variants",
+        "Emit anyOf/oneOf object variants as struct variants (`Body::Variant { .. }`). Set to false\n\
+         for newtype variants wrapping a struct (`Body::Variant(Variant)`).",
     ),
     (
         "enabled",
@@ -264,6 +273,7 @@ fn generate(config_path: &Path, input_override: Option<&Path>) -> Result<()> {
         &model,
         &codegen::Options {
             derive_default_when_possible: gen_cfg.derive_default_when_possible,
+            inline_enum_variants: gen_cfg.inline_enum_variants,
         },
     )?;
 
@@ -347,6 +357,7 @@ mod tests {
             parsed.generator.derive_default_when_possible,
             d.generator.derive_default_when_possible
         );
+        assert_eq!(parsed.generator.inline_enum_variants, d.generator.inline_enum_variants);
         assert_eq!(parsed.rustfmt.enabled, d.rustfmt.enabled);
         assert_eq!(parsed.rustfmt.rust_edition, d.rustfmt.rust_edition);
     }

@@ -47,6 +47,9 @@ pub struct Options {
     /// numbers, booleans, `Vec`, maps, `Option`, and other such structs), not only for structs
     /// made of `Option` fields. Enums and `FilePart` fields never qualify.
     pub derive_default_when_possible: bool,
+    /// Emit `anyOf` / `oneOf` variants that are object structs as struct variants
+    /// (`Body::Variant { .. }`) instead of newtype variants (`Body::Variant(Variant)`).
+    pub inline_enum_variants: bool,
 }
 
 /// (file name, contents) pairs to write into the output module directory.
@@ -191,7 +194,7 @@ fn gen_types(model: &Model, opts: &Options) -> Result<String> {
                 }
             }
             TypeDef::StringEnum { values } => gen_string_enum(&mut out, nt, values),
-            TypeDef::Untagged { variants, titles } => gen_untagged(model, &mut out, id, nt, variants, titles, &e),
+            TypeDef::Untagged { variants, titles } => gen_untagged(model, &mut out, id, nt, variants, titles, opts, &e)?,
         }
         out.push('\n');
     }
@@ -217,22 +220,39 @@ fn gen_struct(
     derive_default: bool,
     e: &Emit,
 ) -> Result<()> {
-    let names = field_names(fields);
     let mut derives = vec!["Serialize", "Deserialize", "Clone", "Debug", "PartialEq"];
     if derive_default {
         derives.push("Default");
     }
     let _ = writeln!(out, "#[derive({})]", derives.join(", "));
     let _ = writeln!(out, "pub struct {} {{", nt.name);
+    gen_fields(model, out, self_id, &nt.name, fields, extra, "    ", "pub ", e)?;
+    out.push_str("}\n");
+    Ok(())
+}
+
+/// Field list shared by structs and inlined enum variants. `vis` is `"pub "` or `""`.
+#[allow(clippy::too_many_arguments)]
+fn gen_fields(
+    model: &Model,
+    out: &mut String,
+    self_id: TypeId,
+    type_name: &str,
+    fields: &[Field],
+    extra: Option<&TypeRef>,
+    ind: &str,
+    vis: &str,
+    e: &Emit,
+) -> Result<()> {
+    let names = field_names(fields);
     for (f, name) in fields.iter().zip(&names) {
         if contains_upload(model, &f.ty) {
             bail!(
-                "type {}: file uploads are only supported as direct fields of a multipart request body",
-                nt.name
+                "type {type_name}: file uploads are only supported as direct fields of a multipart request body"
             );
         }
         if let Some(d) = &f.description {
-            doc_comment(out, "    ", d);
+            doc_comment(out, ind, d);
         }
         let mut attrs: Vec<String> = Vec::new();
         if naming::strip_raw(name) != f.json_name {
@@ -243,23 +263,22 @@ fn gen_struct(
             attrs.push("skip_serializing_if = \"Option::is_none\"".into());
         }
         if !attrs.is_empty() {
-            let _ = writeln!(out, "    #[serde({})]", attrs.join(", "));
+            let _ = writeln!(out, "{ind}#[serde({})]", attrs.join(", "));
         }
         let ty = boxed_if_recursive(model, &f.ty, self_id, e);
-        let _ = writeln!(out, "    pub {name}: {ty},");
+        let _ = writeln!(out, "{ind}{vis}{name}: {ty},");
     }
     if let Some(extra) = extra {
         let mut taken: HashSet<String> = names.iter().cloned().collect();
         let name = naming::unique("additional_properties", "_", &mut taken);
-        out.push_str("    /// Properties not covered by the named fields.\n");
-        out.push_str("    #[serde(flatten)]\n");
+        let _ = writeln!(out, "{ind}/// Properties not covered by the named fields.");
+        let _ = writeln!(out, "{ind}#[serde(flatten)]");
         let _ = writeln!(
             out,
-            "    pub {name}: std::collections::HashMap<String, {}>,",
+            "{ind}{vis}{name}: std::collections::HashMap<String, {}>,",
             rust_type(model, extra, e)
         );
     }
-    out.push_str("}\n");
     Ok(())
 }
 
@@ -423,6 +442,24 @@ fn variant_base_name(model: &Model, t: &TypeRef) -> String {
     }
 }
 
+/// Fields of a variant that should be emitted as a struct variant instead of a newtype one.
+fn inline_struct<'a>(
+    model: &'a Model,
+    v: &TypeRef,
+    opts: &Options,
+) -> Option<(&'a [Field], Option<&'a TypeRef>)> {
+    if !opts.inline_enum_variants {
+        return None;
+    }
+    match model.resolve(v) {
+        TypeRef::Named(id) => match &model.types[id].def {
+            TypeDef::Struct { fields, extra, multipart: false } => Some((fields, extra.as_ref())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn gen_untagged(
     model: &Model,
     out: &mut String,
@@ -430,8 +467,9 @@ fn gen_untagged(
     nt: &NamedType,
     variants: &[TypeRef],
     titles: &[Option<String>],
+    opts: &Options,
     e: &Emit,
-) {
+) -> Result<()> {
     let mut taken: HashSet<String> = HashSet::new();
     let names: Vec<String> = variants
         .iter()
@@ -449,13 +487,23 @@ fn gen_untagged(
     );
     let _ = writeln!(out, "pub enum {} {{", nt.name);
     for (v, name) in variants.iter().zip(&names) {
-        let _ = writeln!(
-            out,
-            "    {name}({}),",
-            boxed_if_recursive(model, v, self_id, e)
-        );
+        match inline_struct(model, v, opts) {
+            Some((fields, extra)) => {
+                let _ = writeln!(out, "    {name} {{");
+                gen_fields(model, out, self_id, &nt.name, fields, extra, "        ", "", e)?;
+                out.push_str("    },\n");
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "    {name}({}),",
+                    boxed_if_recursive(model, v, self_id, e)
+                );
+            }
+        }
     }
     out.push_str("}\n");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1092,6 +1140,25 @@ mod tests {
     }
 
     #[test]
+    fn inline_enum_variants_emit_struct_variants() {
+        let doc = serde_json::json!({
+            "openapi": "3.1.0", "info": {"title": "t", "version": "1"},
+            "paths": {"/e": {"post": {"operationId": "post_events",
+                "requestBody": {"content": {"application/json": {"schema": {"oneOf": [
+                    {"title": "AEvent", "type": "object", "required": ["a_id"], "properties": {"a_id": {"type": "string"}}},
+                    {"type": "string"}
+                ]}}}},
+                "responses": {"200": {"description": "ok"}}}}}
+        });
+        let model = crate::model::build(&doc, false).unwrap();
+        let plain = gen_types(&model, &Options::default()).unwrap();
+        assert!(plain.contains("AEvent(AEvent),"));
+        let inl = gen_types(&model, &Options { inline_enum_variants: true, ..Default::default() }).unwrap();
+        assert!(inl.contains("AEvent {\n        a_id: String,\n    },"), "{inl}");
+        assert!(inl.contains("String(String),"), "{inl}");
+    }
+
+    #[test]
     fn base_url_falls_back_to_spec_servers() {
         let with = mod_rs_for(serde_json::json!([{"url": "https://api.example.com/v1"}]));
         assert!(
@@ -1128,7 +1195,7 @@ mod tests {
         assert!(!derive_of(&plain, "ABody").contains("Default"));
         assert!(!derive_of(&plain, "Nested").contains("Default"));
 
-        let wide = gen_types(&model, &Options { derive_default_when_possible: true }).unwrap();
+        let wide = gen_types(&model, &Options { derive_default_when_possible: true, ..Default::default() }).unwrap();
         // `kind` is an enum, so the body still cannot be Default; the nested struct can.
         assert!(!derive_of(&wide, "ABody").contains("Default"));
         assert!(derive_of(&wide, "Nested").contains("Default"));
