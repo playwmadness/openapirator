@@ -13,6 +13,7 @@ pub const DEPENDENCIES: &[(&str, &str, &[&str])] = &[
     ("serde", "1", &["derive"]),
     ("serde_json", "1", &[]),
     ("tokio", "1", &["rt-multi-thread", "macros"]),
+    ("uuid", "1", &["serde"]),
 ];
 
 /// A POSIX shell script of `cargo add` commands that installs [`DEPENDENCIES`] into the crate
@@ -79,6 +80,7 @@ fn rust_type(model: &Model, t: &TypeRef, e: &Emit) -> String {
         TypeRef::Int => "i64".into(),
         TypeRef::Float => "f64".into(),
         TypeRef::Bool => "bool".into(),
+        TypeRef::Uuid => "uuid::Uuid".into(),
         TypeRef::Any => "serde_json::Value".into(),
         TypeRef::Option(x) => format!("Option<{}>", rust_type(model, &x, e)),
         TypeRef::Vec(x) => format!("Vec<{}>", rust_type(model, &x, e)),
@@ -122,7 +124,7 @@ fn doc_comment(out: &mut String, indent: &str, text: &str) {
 fn default_derives(model: &Model, opts: &Options) -> Vec<bool> {
     fn ty_ok(model: &Model, t: &TypeRef, opts: &Options, memo: &mut Vec<Option<bool>>, stack: &mut Vec<TypeId>) -> bool {
         match model.resolve(t) {
-            TypeRef::String | TypeRef::Int | TypeRef::Float | TypeRef::Bool | TypeRef::Any => true,
+            TypeRef::String | TypeRef::Int | TypeRef::Float | TypeRef::Bool | TypeRef::Uuid | TypeRef::Any => true,
             TypeRef::Option(_) | TypeRef::Vec(_) | TypeRef::Map(_) => true,
             TypeRef::Upload => false,
             TypeRef::Named(id) => named_ok(model, id, opts, memo, stack),
@@ -367,7 +369,7 @@ fn form_push(
         TypeRef::String => {
             let _ = writeln!(out, "{indent}form = form.text({name}, {var});");
         }
-        TypeRef::Int | TypeRef::Float | TypeRef::Bool => {
+        TypeRef::Int | TypeRef::Float | TypeRef::Bool | TypeRef::Uuid => {
             let _ = writeln!(out, "{indent}form = form.text({name}, {var}.to_string());");
         }
         t if is_string_enum(model, &t) => {
@@ -411,6 +413,7 @@ fn variant_base_name(model: &Model, t: &TypeRef) -> String {
         TypeRef::Int => "Integer".into(),
         TypeRef::Float => "Number".into(),
         TypeRef::Bool => "Boolean".into(),
+        TypeRef::Uuid => "Uuid".into(),
         TypeRef::Any => "Any".into(),
         TypeRef::Upload => "File".into(),
         TypeRef::Option(x) => format!("Optional{}", variant_base_name(model, &x)),
@@ -469,6 +472,7 @@ fn param_arg(model: &Model, t: &TypeRef, e: &Emit) -> (String, ToWire) {
         TypeRef::Int => ("i64".into(), Box::new(|v| format!("{v}.to_string()"))),
         TypeRef::Float => ("f64".into(), Box::new(|v| format!("{v}.to_string()"))),
         TypeRef::Bool => ("bool".into(), Box::new(|v| format!("{v}.to_string()"))),
+        TypeRef::Uuid => ("uuid::Uuid".into(), Box::new(|v| format!("{v}.to_string()"))),
         t if is_string_enum(model, &t) => (
             rust_type(model, &t, e),
             Box::new(|v| format!("{v}.as_str().to_string()")),

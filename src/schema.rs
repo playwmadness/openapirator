@@ -363,7 +363,13 @@ impl<'a> Converter<'a> {
             "string" => {
                 let binary = obj.get("format").and_then(Value::as_str) == Some("binary")
                     || obj.get("contentEncoding").and_then(Value::as_str) == Some("binary");
-                if binary && scope.multipart { TypeRef::Upload } else { TypeRef::String }
+                if binary && scope.multipart {
+                    TypeRef::Upload
+                } else if obj.get("format").and_then(Value::as_str) == Some("uuid") {
+                    TypeRef::Uuid
+                } else {
+                    TypeRef::String
+                }
             }
             "integer" => TypeRef::Int,
             "number" => TypeRef::Float,
@@ -534,6 +540,7 @@ impl<'a> Converter<'a> {
             TypeRef::Int => "i".into(),
             TypeRef::Float => "f".into(),
             TypeRef::Bool => "b".into(),
+            TypeRef::Uuid => "uu".into(),
             TypeRef::Any => "a".into(),
             TypeRef::Upload => "u".into(),
             TypeRef::Option(x) => format!("o({})", self.ref_key(&x, slot)),

@@ -9,6 +9,8 @@ pub enum TypeRef {
     Int,
     Float,
     Bool,
+    /// `uuid::Uuid` (`format: uuid`)
+    Uuid,
     /// `serde_json::Value`
     Any,
     Option(Box<TypeRef>),
