@@ -49,6 +49,14 @@ impl Ctx {
         c
     }
 
+    /// Like [`Ctx::variant`], but named after the member's `title`.
+    pub fn titled_variant(&self, title: &str) -> Ctx {
+        let mut c = self.clone();
+        c.chain.push(naming::pascal(title));
+        c.last_is_prop = false;
+        c
+    }
+
     pub fn variant(&self, i: usize) -> Ctx {
         let mut c = self.clone();
         c.chain.push(format!("Variant{i}"));
@@ -159,9 +167,14 @@ impl<'a> Converter<'a> {
                         s
                     }
                     TypeDef::StringEnum { values } => format!("E{{{}}}", values.join("\u{1}")),
-                    TypeDef::Untagged { variants } => format!(
+                    TypeDef::Untagged { variants, titles } => format!(
                         "U{{{}}}",
-                        variants.iter().map(|v| self.deep_key(v, stack)).collect::<Vec<_>>().join("|")
+                        variants
+                            .iter()
+                            .zip(titles)
+                            .map(|(v, t)| format!("{}{}", t.as_deref().unwrap_or(""), self.deep_key(v, stack)))
+                            .collect::<Vec<_>>()
+                            .join("|")
                     ),
                 };
                 stack.pop();
@@ -208,7 +221,7 @@ impl<'a> Converter<'a> {
 
     fn alloc_placeholder(&mut self) -> TypeId {
         self.types.push(NamedType {
-            def: TypeDef::Untagged { variants: Vec::new() },
+            def: TypeDef::Untagged { variants: Vec::new(), titles: Vec::new() },
             candidates: Vec::new(),
             description: None,
             name: String::new(),
@@ -299,10 +312,17 @@ impl<'a> Converter<'a> {
                     return Ok(wrap(t, nullable));
                 }
                 let mut variants = Vec::new();
+                let mut titles = Vec::new();
                 for (i, m) in rest.iter().enumerate() {
-                    variants.push(self.convert(m, &ctx.variant(i), scope)?);
+                    let title = m.get("title").and_then(Value::as_str).filter(|t| !t.trim().is_empty());
+                    let vctx = match title {
+                        Some(t) => ctx.titled_variant(t),
+                        None => ctx.variant(i),
+                    };
+                    variants.push(self.convert(m, &vctx, scope)?);
+                    titles.push(title.map(str::to_string));
                 }
-                let t = self.intern(TypeDef::Untagged { variants }, ctx, description, slot);
+                let t = self.intern(TypeDef::Untagged { variants, titles }, ctx, description, slot);
                 return Ok(wrap(t, nullable));
             }
         }
@@ -324,7 +344,8 @@ impl<'a> Converter<'a> {
             for (i, ty) in types.iter().enumerate() {
                 variants.push(self.convert_typed(obj, ty, &ctx.variant(i), scope, None, None)?);
             }
-            self.intern(TypeDef::Untagged { variants }, ctx, description, slot)
+            let titles = vec![None; variants.len()];
+            self.intern(TypeDef::Untagged { variants, titles }, ctx, description, slot)
         };
         Ok(wrap(t, nullable))
     }
@@ -472,7 +493,7 @@ impl<'a> Converter<'a> {
     }
 
     fn intern(&mut self, def: TypeDef, ctx: &Ctx, description: Option<String>, slot: Option<TypeId>) -> TypeRef {
-        if let TypeDef::Untagged { variants } = &def
+        if let TypeDef::Untagged { variants, .. } = &def
             && self.is_json_value_shape(variants, slot)
         {
             return TypeRef::Any;
@@ -538,8 +559,13 @@ impl<'a> Converter<'a> {
                 s
             }
             TypeDef::StringEnum { values } => format!("E{{{}}}", values.join("\u{1}")),
-            TypeDef::Untagged { variants } => {
-                format!("U{{{}}}", variants.iter().map(|v| self.ref_key(v, slot)).collect::<Vec<_>>().join("|"))
+            TypeDef::Untagged { variants, titles } => {
+                let parts: Vec<String> = variants
+                    .iter()
+                    .zip(titles)
+                    .map(|(v, t)| format!("{}{}", t.as_deref().unwrap_or(""), self.ref_key(v, slot)))
+                    .collect();
+                format!("U{{{}}}", parts.join("|"))
             }
         }
     }
@@ -656,5 +682,20 @@ mod tests {
         let TypeDef::Struct { fields, multipart, .. } = &c.types[id].def else { panic!() };
         assert!(*multipart);
         assert_eq!(fields[0].ty, TypeRef::Option(Box::new(TypeRef::Vec(Box::new(TypeRef::Upload)))));
+    }
+
+    #[test]
+    fn titled_variants_name_types_and_variants() {
+        let doc = json!({});
+        let s = json!({"oneOf": [
+            {"type": "object", "properties": {"a": {"type": "string"}}, "title": "GpuShutdownEvent"},
+            {"type": "object", "properties": {"b": {"type": "string"}}}
+        ]});
+        let (types, t) = conv(&doc, &s, "Event");
+        let TypeRef::Named(id) = t else { panic!() };
+        let TypeDef::Untagged { titles, .. } = &types[id].def else { panic!() };
+        assert_eq!(titles, &vec![Some("GpuShutdownEvent".to_string()), None]);
+        assert_eq!(types[0].candidates, vec!["GpuShutdownEvent", "EventGpuShutdownEvent"]);
+        assert_eq!(types[1].candidates, vec!["Variant1", "EventVariant1"]);
     }
 }

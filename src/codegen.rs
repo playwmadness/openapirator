@@ -189,7 +189,7 @@ fn gen_types(model: &Model, opts: &Options) -> Result<String> {
                 }
             }
             TypeDef::StringEnum { values } => gen_string_enum(&mut out, nt, values),
-            TypeDef::Untagged { variants } => gen_untagged(model, &mut out, id, nt, variants, &e),
+            TypeDef::Untagged { variants, titles } => gen_untagged(model, &mut out, id, nt, variants, titles, &e),
         }
         out.push('\n');
     }
@@ -426,12 +426,20 @@ fn gen_untagged(
     self_id: TypeId,
     nt: &NamedType,
     variants: &[TypeRef],
+    titles: &[Option<String>],
     e: &Emit,
 ) {
     let mut taken: HashSet<String> = HashSet::new();
     let names: Vec<String> = variants
         .iter()
-        .map(|v| naming::unique(&variant_base_name(model, v), "", &mut taken))
+        .zip(titles)
+        .map(|(v, title)| {
+            let base = match title {
+                Some(t) => naming::type_ident(t),
+                None => variant_base_name(model, v),
+            };
+            naming::unique(&base, "", &mut taken)
+        })
         .collect();
     out.push_str(
         "#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]\n#[serde(untagged)]\n",

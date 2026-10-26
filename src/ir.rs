@@ -58,6 +58,8 @@ pub enum TypeDef {
     /// `anyOf` / `oneOf`: an untagged enum.
     Untagged {
         variants: Vec<TypeRef>,
+        /// Per-variant `title` metadata, used to name the variant. Same length as `variants`.
+        titles: Vec<Option<String>>,
     },
 }
 
