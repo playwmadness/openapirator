@@ -267,7 +267,8 @@ pub fn build(doc: &Value, dedup_types: bool) -> Result<Model> {
                 })
                 .collect();
             codes.sort();
-            for wildcard in ["2XX", "2xx", "default"] {
+            // `default` is not a success: it covers every status not listed, usually errors.
+            for wildcard in ["2XX", "2xx"] {
                 if let Some(k) = responses.keys().find(|k| k.as_str() == wildcard) {
                     codes.push(k);
                 }
@@ -295,7 +296,7 @@ pub fn build(doc: &Value, dedup_types: bool) -> Result<Model> {
                 }
             }
             for (code, resp) in responses {
-                if code.starts_with('2') || code == "default" {
+                if code.starts_with('2') {
                     continue;
                 }
                 let resp = spec::deref(doc, doc, resp)?;
@@ -333,12 +334,13 @@ pub fn build(doc: &Value, dedup_types: bool) -> Result<Model> {
 
     // Compare structurally so the typed error payload survives `dedup_types = false`, where an
     // inline copy of the error schema is a distinct (but wire-compatible) type.
+    let first_key = error_schemas.first().map(|t| conv.structural_key(t));
     let error_type = match error_schemas.first() {
         Some(first)
             if matches!(first, TypeRef::Named(_))
                 && error_schemas
                     .iter()
-                    .all(|t| conv.structural_key(t) == conv.structural_key(first)) =>
+                    .all(|t| Some(conv.structural_key(t)) == first_key) =>
         {
             first.clone()
         }
@@ -508,6 +510,25 @@ mod tests {
         assert_eq!(m.operations[2].name, "get_c");
         assert_eq!(m.operations[3].name, "get_c_2");
         assert_eq!(m.untagged, vec![0, 1]);
+    }
+
+    #[test]
+    fn default_response_is_an_error_not_the_success_type() {
+        let err = json!({"content": {"application/json": {"schema": {
+            "type": "object", "properties": {"message": {"type": "string"}}}}}});
+        let doc = json!({
+            "openapi": "3.1.0", "info": {"title": "t", "version": "1"},
+            "paths": {
+                "/only": {"get": {"operationId": "only", "responses": {"default": err}}},
+                "/both": {"get": {"operationId": "both", "responses": {
+                    "200": {"content": {"application/json": {"schema": {"type": "string"}}}},
+                    "default": err}}}
+            }
+        });
+        let m = build(&doc, false).unwrap();
+        assert!(matches!(m.operations[0].response, Response::Raw));
+        assert!(matches!(m.operations[1].response, Response::Json(TypeRef::String)));
+        assert!(matches!(m.error_type, TypeRef::Named(_)), "default schema types the error");
     }
 
     #[test]
