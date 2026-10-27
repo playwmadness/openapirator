@@ -503,6 +503,41 @@ fn gen_untagged(
         }
     }
     out.push_str("}\n");
+
+    // An inlined variant duplicates a standalone struct: convert between the two.
+    let mut seen: HashSet<TypeId> = HashSet::new();
+    for (v, name) in variants.iter().zip(&names) {
+        let Some((fields, extra)) = inline_struct(model, v, opts) else { continue };
+        let TypeRef::Named(sid) = model.resolve(v) else { continue };
+        // Fields pointing back at the enum are boxed in the variant but not in the struct.
+        let recursive = fields.iter().any(|f| {
+            let t = model.resolve(&f.ty);
+            let t = match t {
+                TypeRef::Option(x) => model.resolve(&x),
+                t => t,
+            };
+            matches!(t, TypeRef::Named(id) if id == self_id)
+        });
+        if recursive || !seen.insert(sid) {
+            continue;
+        }
+        let mut binds = field_names(fields);
+        if extra.is_some() {
+            let mut taken: HashSet<String> = binds.iter().cloned().collect();
+            binds.push(naming::unique("additional_properties", "_", &mut taken));
+        }
+        let list = binds.join(", ");
+        let st = rust_type(model, v, e);
+        let en = &nt.name;
+        let _ = write!(
+            out,
+            "\nimpl From<{st}> for {en} {{\n    fn from(value: {st}) -> Self {{\n        let {st} {{ {list} }} = value;\n        Self::{name} {{ {list} }}\n    }}\n}}\n"
+        );
+        let _ = write!(
+            out,
+            "\nimpl TryFrom<{en}> for {st} {{\n    type Error = {en};\n\n    fn try_from(value: {en}) -> Result<Self, Self::Error> {{\n        match value {{\n            {en}::{name} {{ {list} }} => Ok(Self {{ {list} }}),\n            other => Err(other),\n        }}\n    }}\n}}\n"
+        );
+    }
     Ok(())
 }
 
@@ -1156,6 +1191,9 @@ mod tests {
         let inl = gen_types(&model, &Options { inline_enum_variants: true, ..Default::default() }).unwrap();
         assert!(inl.contains("AEvent {\n        a_id: String,\n    },"), "{inl}");
         assert!(inl.contains("String(String),"), "{inl}");
+        assert!(inl.contains("impl From<AEvent> for "), "{inl}");
+        assert!(inl.contains("type Error = "), "{inl}");
+        assert!(!plain.contains("impl From<AEvent>"), "{plain}");
     }
 
     #[test]
