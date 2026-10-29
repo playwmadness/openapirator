@@ -155,7 +155,8 @@ fn default_derives(model: &Model, opts: &Options) -> Vec<bool> {
                 ok
             }
             TypeDef::Struct { fields, .. } => fields.iter().all(|f| f.ty.is_option()),
-            TypeDef::StringEnum { .. } | TypeDef::Untagged { .. } => false,
+            TypeDef::StringEnum { values } => values.len() == 1,
+            TypeDef::Untagged { .. } => false,
         };
         memo[id] = Some(v);
         v
@@ -199,6 +200,7 @@ fn gen_types(model: &Model, opts: &Options) -> Result<String> {
                     gen_struct(model, &mut out, id, nt, fields, extra.as_ref(), defaults[id], &e)?;
                 }
             }
+            TypeDef::StringEnum { values } if values.len() == 1 => gen_unit_struct(&mut out, nt, &values[0]),
             TypeDef::StringEnum { values } => gen_string_enum(&mut out, nt, values),
             TypeDef::Untagged { variants, titles } => gen_untagged(model, &mut out, id, nt, variants, titles, opts, &e)?,
         }
@@ -408,6 +410,22 @@ fn form_push(
         }
     }
     Ok(())
+}
+
+/// A single-valued string enum: a unit struct that serializes as, and only accepts, that value.
+fn gen_unit_struct(out: &mut String, nt: &NamedType, value: &str) {
+    let name = &nt.name;
+    out.push_str("#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]\n");
+    let _ = writeln!(out, "pub struct {name};\n");
+    let _ = writeln!(out, "impl {name} {{");
+    let _ = writeln!(out, "    pub fn as_str(&self) -> &'static str {{\n        {value:?}\n    }}\n}}\n");
+    let _ = writeln!(out, "impl std::fmt::Display for {name} {{");
+    out.push_str("    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        f.write_str(self.as_str())\n    }\n}\n\n");
+    let _ = writeln!(out, "impl Serialize for {name} {{");
+    out.push_str("    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {\n        serializer.serialize_str(self.as_str())\n    }\n}\n\n");
+    let _ = writeln!(out, "impl<'de> Deserialize<'de> for {name} {{");
+    out.push_str("    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {\n        let s = String::deserialize(deserializer)?;\n");
+    let _ = writeln!(out, "        if s == {value:?} {{\n            Ok(Self)\n        }} else {{\n            Err(serde::de::Error::invalid_value(serde::de::Unexpected::Str(&s), &{value:?}))\n        }}\n    }}\n}}");
 }
 
 fn gen_string_enum(out: &mut String, nt: &NamedType, values: &[String]) {
@@ -1188,6 +1206,24 @@ mod tests {
         });
         let model = crate::model::build(&doc, false).unwrap();
         gen_mod(&model).unwrap()
+    }
+
+    #[test]
+    fn single_value_enum_is_a_unit_struct() {
+        let doc = serde_json::json!({
+            "openapi": "3.1.0", "info": {"title": "t", "version": "1"},
+            "paths": {"/e": {"post": {"operationId": "post_e",
+                "requestBody": {"content": {"application/json": {"schema": {
+                    "type": "object", "required": ["kind"],
+                    "properties": {"kind": {"type": "string", "enum": ["only_one"]}}}}}},
+                "responses": {"200": {"description": "ok"}}}}}
+        });
+        let model = crate::model::build(&doc, false).unwrap();
+        let out = gen_types(&model, &Options::default()).unwrap();
+        assert!(out.contains("Default, PartialEq, Eq, Hash)]\npub struct "), "{out}");
+        assert!(out.contains("impl Serialize for "), "{out}");
+        assert!(out.contains("\"only_one\""), "{out}");
+        assert!(!out.contains("serde(rename = \"only_one\")"), "{out}");
     }
 
     #[test]
